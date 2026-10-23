@@ -1,4 +1,4 @@
-"""Finite-choice Microsoft Decision 1 agent using native BrowserSession and Tools."""
+"""Finite-choice decision agent using native BrowserSession and Tools."""
 
 import hashlib
 import json
@@ -126,6 +126,97 @@ class AzureMicrosoftDecisionClient:
 			raise ValueError('Invalid Decision 1 response; no action executed.') from None
 
 
+class _OpenAIProbability(BaseModel):
+	model_config = ConfigDict(strict=True)
+	value: str
+	probability: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+
+class _OpenAIAnswer(BaseModel):
+	model_config = ConfigDict(strict=True)
+	name: str
+	type: Literal['choice', 'refusal']
+	choice: str | None = None
+	confidence: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+	probabilities: list[_OpenAIProbability] | None = None
+
+
+class _OpenAIResponse(BaseModel):
+	model_config = ConfigDict(strict=True)
+	model: str = Field(min_length=1)
+	answers: list[_OpenAIAnswer]
+
+
+class OpenAIDecisionClient:
+	"""OpenAI Decisions client with a fixed HTTPS endpoint and no retries."""
+
+	def __init__(
+		self,
+		*,
+		api_key: str | None = None,
+		model: str | None = None,
+		transport: httpx.AsyncBaseTransport | None = None,
+	):
+		key = (api_key or os.getenv('OPENAI_API_KEY', '')).strip()
+		if not key:
+			raise ValueError('Set OPENAI_API_KEY.')
+		self.model = model or os.getenv('OPENAI_DECISION_MODEL', 'gpt-6-luna')
+		self._key = SecretStr(key)
+		self._transport = transport
+
+	async def predict(self, request: DecisionRequest) -> DecisionResponse:
+		"""Normalize named answers while preserving selected-head validation."""
+		body = {
+			'model': self.model,
+			'input': json.dumps(request.state, ensure_ascii=False, sort_keys=True),
+			'questions': [
+				{
+					'name': name,
+					'type': 'choice',
+					'instructions': question.instructions,
+					'choices': [{'value': value, 'description': description} for value, description in question.criteria.items()],
+				}
+				for name, question in request.questions.items()
+			],
+		}
+		try:
+			async with httpx.AsyncClient(transport=self._transport, timeout=60, follow_redirects=False) as client:
+				response = await client.post(
+					'https://api.openai.com/v1/decisions',
+					headers={'Authorization': f'Bearer {self._key.get_secret_value()}'},
+					json=body,
+				)
+		except httpx.HTTPError:
+			raise RuntimeError('OpenAI Decisions connection failed; no action executed.') from None
+		if response.status_code == 429:
+			raise RuntimeError('OpenAI Decisions rate limit reached; wait for quota reset, then run with a fresh observation.')
+		if not 200 <= response.status_code < 300:
+			raise RuntimeError(f'OpenAI Decisions returned HTTP {response.status_code}; no action executed.')
+		try:
+			result = _OpenAIResponse.model_validate_json(response.content)
+			answers: dict[str, JsonValue] = {}
+			for answer in result.answers:
+				if answer.name not in request.questions or answer.name in answers:
+					raise ValueError()
+				if answer.type == 'refusal':
+					answers[answer.name] = {'type': 'refusal'}
+					continue
+				if answer.choice is None or answer.confidence is None or answer.probabilities is None:
+					raise ValueError()
+				probabilities: dict[str, JsonValue] = {p.value: p.probability for p in answer.probabilities}
+				if len(probabilities) != len(answer.probabilities):
+					raise ValueError()
+				answers[answer.name] = {
+					'type': 'choice',
+					'choice': answer.choice,
+					'confidence': answer.confidence,
+					'probabilities': probabilities,
+				}
+			return DecisionResponse(model=result.model, answers=answers)
+		except (ValidationError, ValueError):
+			raise ValueError('Invalid OpenAI Decisions response; no action executed.') from None
+
+
 class DecisionTask(BaseModel):
 	task: str = Field(min_length=1, max_length=4000)
 
@@ -160,7 +251,7 @@ class DecisionRunResult(BaseModel):
 	verified: bool | None = Field(default=None, strict=True)
 
 
-class MicrosoftDecisionAgent:
+class DecisionAgent:
 	"""Observe, choose finite operations, recheck freshness, then execute once.
 
 	An existing browser remains owned by its caller. No browser or model is provisioned
@@ -477,3 +568,7 @@ class MicrosoftDecisionAgent:
 		finally:
 			if self._owns_browser:
 				await self.browser.stop()
+
+
+# Compatibility for existing Azure integrations.
+MicrosoftDecisionAgent = DecisionAgent

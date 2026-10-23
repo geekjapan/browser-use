@@ -535,3 +535,193 @@ async def test_select_label_value_collision_uses_safe_value_in_native_action():
 	assert cast(AsyncMock, a.tools.act).call_args.args[0].model_dump(exclude_unset=True) == {
 		'select_dropdown': {'index': 1, 'text': 'cyan'}
 	}
+
+
+def openai_request():
+	return DecisionRequest(
+		model='azure-model-is-not-used',
+		state={'url': 'https://example.test', 'task': 'Finish'},
+		questions={'operation': ChoiceQuestion(instructions='Choose', criteria={'DONE': 'Done', 'BLOCKED': 'Blocked'})},
+	)
+
+
+def openai_answer(name='operation', choice='DONE', candidates=('DONE', 'BLOCKED')):
+	value = answer(choice, candidates)
+	value['name'] = name
+	value['probabilities'] = [{'value': key, 'probability': probability} for key, probability in value['probabilities'].items()]
+	return value
+
+
+async def test_openai_http_contract_and_environment(monkeypatch):
+	from browser_use import DecisionAgent, OpenAIDecisionClient
+
+	assert DecisionAgent is MicrosoftDecisionAgent
+	monkeypatch.setenv('OPENAI_API_KEY', 'key-secret')
+	monkeypatch.setenv('OPENAI_DECISION_MODEL', 'configured-model')
+
+	def handle(request):
+		assert str(request.url) == 'https://api.openai.com/v1/decisions'
+		assert request.headers['Authorization'] == 'Bearer key-secret'
+		body = json.loads(request.content)
+		assert body == {
+			'model': 'configured-model',
+			'input': json.dumps(openai_request().state, ensure_ascii=False, sort_keys=True),
+			'questions': [
+				{
+					'name': 'operation',
+					'type': 'choice',
+					'instructions': 'Choose',
+					'choices': [{'value': 'DONE', 'description': 'Done'}, {'value': 'BLOCKED', 'description': 'Blocked'}],
+				}
+			],
+		}
+		return httpx.Response(200, json={'model': 'configured-model', 'answers': [openai_answer()], 'usage': {'total_tokens': 5}})
+
+	client = OpenAIDecisionClient(transport=httpx.MockTransport(handle))
+	response = await client.predict(openai_request())
+	assert (
+		ChoiceAnswer.validate_for(response.answers['operation'], openai_request().questions['operation'].criteria).choice
+		== 'DONE'
+	)
+	monkeypatch.delenv('OPENAI_DECISION_MODEL')
+	assert OpenAIDecisionClient().model == 'gpt-6-luna'
+	assert OpenAIDecisionClient(model='explicit-model').model == 'explicit-model'
+	assert 'key-secret' not in repr(client.__dict__)
+
+
+@pytest.mark.parametrize('status', [302, 400, 401, 429, 503])
+async def test_openai_http_errors_are_sanitized_without_retries(status):
+	from browser_use import OpenAIDecisionClient
+
+	calls = []
+
+	def handle(request):
+		calls.append(request)
+		return httpx.Response(status, text='secret provider response')
+
+	client = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handle))
+	with pytest.raises(RuntimeError) as error:
+		await client.predict(openai_request())
+	assert 'secret' not in str(error.value)
+	assert len(calls) == 1
+
+
+async def test_openai_missing_auth_network_and_invalid_json(monkeypatch):
+	from browser_use import OpenAIDecisionClient
+
+	monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+	with pytest.raises(ValueError, match='OPENAI_API_KEY'):
+		OpenAIDecisionClient()
+
+	def fail(request):
+		raise httpx.ConnectError('secret network detail', request=request)
+
+	for handler, exception in [
+		(fail, RuntimeError),
+		(lambda request: httpx.Response(200, text='secret invalid JSON'), ValueError),
+	]:
+		client = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handler))
+		with pytest.raises(exception) as error:
+			await client.predict(openai_request())
+		assert 'secret' not in str(error.value)
+
+
+@pytest.mark.parametrize(
+	'change',
+	[
+		{'name': 12},
+		{'name': 'unknown'},
+		{'type': 'score'},
+		{'choice': 1},
+		{'choice': None},
+		{'confidence': True},
+		{'confidence': '0.8'},
+		{'confidence': None},
+		{'probabilities': None},
+		{'probabilities': [{'value': 'DONE', 'probability': True}]},
+		{'probabilities': [{'value': 1, 'probability': 1.0}]},
+		{'probabilities': [{'value': 'DONE', 'probability': 1.0}, {'value': 'DONE', 'probability': 0.0}]},
+	],
+)
+async def test_openai_rejects_malformed_named_answers(change):
+	from browser_use import OpenAIDecisionClient
+
+	client = OpenAIDecisionClient(
+		api_key='secret',
+		transport=httpx.MockTransport(
+			lambda request: httpx.Response(200, json={'model': 'gpt-6-luna', 'answers': [openai_answer() | change]})
+		),
+	)
+	with pytest.raises(ValueError, match='Invalid OpenAI Decisions response'):
+		await client.predict(openai_request())
+
+
+async def test_openai_rejects_duplicate_heads():
+	from browser_use import OpenAIDecisionClient
+
+	client = OpenAIDecisionClient(
+		api_key='secret',
+		transport=httpx.MockTransport(
+			lambda request: httpx.Response(200, json={'model': 'gpt-6-luna', 'answers': [openai_answer(), openai_answer()]})
+		),
+	)
+	with pytest.raises(ValueError, match='Invalid OpenAI Decisions response'):
+		await client.predict(openai_request())
+
+
+@pytest.mark.parametrize('kind', ['missing', 'refusal', 'unknown_choice', 'bad_probabilities'])
+@pytest.mark.parametrize('head', ['operation', 'click_target'])
+async def test_openai_invalid_required_head_never_acts(kind, head):
+	from browser_use import OpenAIDecisionClient
+
+	a, _, _ = agent('click', {1: node(), 2: node(2)})
+
+	def handle(request):
+		questions = json.loads(request.content)['questions']
+		answers = [
+			openai_answer(q['name'], 'click' if q['name'] == 'operation' else '2', [c['value'] for c in q['choices']])
+			for q in questions
+		]
+		for index, value in enumerate(answers):
+			if value['name'] == head:
+				if kind == 'missing':
+					answers.pop(index)
+				elif kind == 'refusal':
+					answers[index] = {'name': head, 'type': 'refusal'}
+				elif kind == 'unknown_choice':
+					value['choice'] = 'invented'
+				else:
+					value['probabilities'] = [{'value': 'invented', 'probability': 1.0}]
+				break
+		return httpx.Response(200, json={'model': 'gpt-6-luna', 'answers': answers})
+
+	a.decision_model = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handle))
+	with pytest.raises(ValueError, match='Invalid Decision'):
+		await a.run(1)
+	cast(AsyncMock, a.tools.act).assert_not_awaited()
+
+
+async def test_openai_native_agent_ignores_unused_refusal(monkeypatch):
+	from browser_use import OpenAIDecisionClient
+
+	a, _, _ = agent('wait', {1: node(), 2: node(2)})
+	a.tools = Tools()
+	sleep = AsyncMock()
+	monkeypatch.setattr('browser_use.tools.service.asyncio.sleep', sleep)
+
+	def handle(request):
+		questions = json.loads(request.content)['questions']
+		return httpx.Response(
+			200,
+			json={
+				'model': 'gpt-6-luna',
+				'answers': [
+					openai_answer('operation', 'wait', [c['value'] for c in questions[0]['choices']]),
+					{'name': 'click_target', 'type': 'refusal'},
+				],
+			},
+		)
+
+	a.decision_model = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handle))
+	assert (await a.run(1)).steps[0].operation == 'wait'
+	sleep.assert_awaited_once_with(1)
