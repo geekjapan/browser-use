@@ -19,6 +19,11 @@ from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.tools.service import Tools
 
+JS_TRIM_CHARACTERS = (
+	'\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004'
+	'\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
+)
+
 
 class ChoiceQuestion(BaseModel):
 	"""A Decision 1 categorical question; singleton choices are resolved locally."""
@@ -343,7 +348,8 @@ class DecisionAgent:
 				values = [option.attributes.get('value', label) for (option, _), label in zip(options, labels)]
 				first_matches: dict[str, int] = {}
 				for position, (label, value) in enumerate(zip(labels, values)):
-					first_matches.setdefault(label.strip().lower(), position)
+					# Match JavaScript String.trim(), including BOM but excluding NEL.
+					first_matches.setdefault(label.strip(JS_TRIM_CHARACTERS).lower(), position)
 					first_matches.setdefault(value.lower(), position)
 				for position, (option, group_disabled) in enumerate(options):
 					if group_disabled or 'disabled' in option.attributes:

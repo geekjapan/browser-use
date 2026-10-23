@@ -535,6 +535,18 @@ def test_select_match_strings_resolve_to_exact_observed_option(options, expected
 		)
 
 
+@pytest.mark.parametrize('disabled', [False, True])
+def test_select_bom_label_collision_excludes_ambiguous_target(disabled):
+	first = option(2, '\ufeffB\ufeff', '\ufeffB\ufeff')
+	first.attributes.pop('value')
+	if disabled:
+		first.attributes['disabled'] = ''
+	a, _, _ = agent()
+	targets = a._targets(state({1: node(tag='select', children=[first, option(3, 'B', 'b')])})).get('select', {})
+	assert '1:1' not in targets
+	assert ('1:0' in targets) is (not disabled)
+
+
 async def test_select_label_value_collision_uses_safe_value_in_native_action():
 	a, _, _ = agent(
 		'select', {1: node(tag='select', children=[option(2, 'Red', 'blue'), option(3, 'Blue', 'cyan')])}, target='1:1'
