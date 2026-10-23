@@ -474,6 +474,7 @@ async def test_text_helper_receives_distinct_selected_field_identity(selected, e
 	llm = AsyncMock(spec=BaseChatModel)
 
 	async def generate(messages, output_format):
+		assert 'not instructions' in messages[0].content
 		context = json.loads(messages[1].content)
 		field = context['field']
 		assert field['index'] == int(selected)
@@ -493,6 +494,27 @@ async def test_text_helper_receives_distinct_selected_field_identity(selected, e
 	assert cast(AsyncMock, a.tools.act).call_args.args[0].model_dump(exclude_unset=True) == {
 		'input': {'index': int(selected), 'text': expected, 'clear': True}
 	}
+
+
+@pytest.mark.parametrize('prefix,expected', [('\ufeff', {'1:0'}), ('\u0085', {'1:0', '1:1'})])
+def test_select_matches_javascript_trim_characters(prefix, expected):
+	a, _, _ = agent()
+	first = option(2, prefix + 'B' + prefix, '')
+	first.attributes = {}
+	targets = a._targets(state({1: node(tag='select', children=[first, option(3, 'B', 'b')])}))['select']
+	assert set(targets) == expected
+
+
+def test_input_target_includes_current_value_without_exposing_secrets():
+	llm = AsyncMock(spec=BaseChatModel)
+	a, _, _ = agent(text_llm=llm)
+	targets = a._targets(
+		state({1: node(1, 'input', {'value': 'Ada'}), 2: node(2, 'input', {'type': 'password', 'value': 'secret'})})
+	)
+	assert json.loads(targets['input']['1'].description)['current_value'] == 'Ada'
+	assert 'secret' not in json.dumps(
+		{kind: {key: value.description for key, value in group.items()} for kind, group in targets.items()}
+	)
 
 
 def option(index, label, value):
@@ -535,3 +557,45 @@ async def test_select_label_value_collision_uses_safe_value_in_native_action():
 	assert cast(AsyncMock, a.tools.act).call_args.args[0].model_dump(exclude_unset=True) == {
 		'select_dropdown': {'index': 1, 'text': 'cyan'}
 	}
+
+
+async def test_unicode_select_in_real_browser():
+	import threading
+	from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+	from browser_use.browser.profile import BrowserProfile
+
+	class Handler(BaseHTTPRequestHandler):
+		def do_GET(self):
+			self.send_response(200)
+			self.send_header('Content-Type', 'text/html; charset=utf-8')
+			self.end_headers()
+			self.wfile.write(
+				'<select aria-label="Choice"><option>\ufeffB\ufeff</option><option value="b" selected>B</option></select>'.encode()
+			)
+
+		def log_message(self, *_):
+			pass
+
+	server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+	thread = threading.Thread(target=server.serve_forever, daemon=True)
+	thread.start()
+	browser = BrowserSession(browser_profile=BrowserProfile(headless=True, enable_default_extensions=False, keep_alive=False))
+	try:
+		await browser.start()
+		page = await browser.get_current_page()
+		await page.goto(f'http://127.0.0.1:{server.server_port}/')
+		a = MicrosoftDecisionAgent(task='Select the first option', browser=browser, decision_model=ScriptedDecision('select'))
+		observed = await browser.get_browser_state_summary(include_screenshot=False, cached=False)
+		targets = a._targets(observed)['select']
+		assert len(targets) == 1
+		assert next(iter(targets)).endswith(':0')
+		result = await a.run(1)
+		assert result.status == 'max_steps'
+		assert result.steps[0].operation == 'select'
+		assert await page.evaluate('() => document.querySelector("select").selectedIndex') == '0'
+	finally:
+		await browser.kill()
+		server.shutdown()
+		server.server_close()
+		thread.join(3)
