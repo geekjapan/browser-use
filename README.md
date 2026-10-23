@@ -102,6 +102,8 @@ Install or upgrade browser-use to the latest stable version with uv using Python
 
 ## Path 3: Python Library
 
+For finite-choice Azure deployments, see [Use Azure Microsoft Decision 1](MICROSOFT_DECISION.md).
+
 Run the Browser Use agent locally from Python, with your choice of model and a local or cloud browser:
 
 **1. Install Browser Use (Python >= 3.11):**
