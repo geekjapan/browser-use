@@ -715,7 +715,7 @@ class Tools(Generic[Context]):
 				if node is None:
 					msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
 					logger.warning(f'⚠️ {msg}')
-					return ActionResult(extracted_content=msg)
+					return ActionResult(error=msg)
 
 				# Get description of clicked element
 				element_desc = get_click_description(node)
@@ -786,7 +786,7 @@ class Tools(Generic[Context]):
 			if node is None:
 				msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
 				logger.warning(f'⚠️ {msg}')
-				return ActionResult(extracted_content=msg)
+				return ActionResult(error=msg)
 
 			# Highlight the element being typed into (truly non-blocking)
 			create_task_with_error_handling(
@@ -1440,7 +1440,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 						except Exception as e:
 							logger.warning(f'Scroll {i + 1}/{num_full_pages} failed: {e}')
-							# Continue with remaining scrolls even if one fails
+							return ActionResult(error='Failed to execute scroll action.')
 
 					# Handle fractional page if present
 					if remaining_fraction > 0:
@@ -1458,6 +1458,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 						except Exception as e:
 							logger.warning(f'Fractional scroll failed: {e}')
+							return ActionResult(error='Failed to execute scroll action.')
 
 					if params.pages == 1.0:
 						long_term_memory = f'Scrolled {direction} {target} {viewport_height}px'.replace('  ', ' ')
@@ -1715,7 +1716,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			if node is None:
 				msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
 				logger.warning(f'⚠️ {msg}')
-				return ActionResult(extracted_content=msg)
+				return ActionResult(error=msg)
 
 			# Dispatch SelectDropdownOptionEvent to the event handler
 			from browser_use.browser.events import SelectDropdownOptionEvent
@@ -1740,6 +1741,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				# TODO: raise BrowserError instead of returning ActionResult
 				if 'short_term_memory' in selection_data and 'long_term_memory' in selection_data:
 					return ActionResult(
+						error=selection_data.get('error') or f'Failed to select option: {params.text}',
 						extracted_content=selection_data['short_term_memory'],
 						long_term_memory=selection_data['long_term_memory'],
 						include_extracted_content_only_once=True,
