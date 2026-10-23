@@ -2,8 +2,9 @@
 
 import copy
 import json
+from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -13,9 +14,11 @@ from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.decision import ChoiceAnswer, ChoiceQuestion, DecisionRequest, DecisionResponse, FieldText
-from browser_use.dom.views import EnhancedAXNode, EnhancedDOMTreeNode, NodeType, SerializedDOMState
+from browser_use.dom.serializer.serializer import DOMTreeSerializer
+from browser_use.dom.views import DOMRect, EnhancedAXNode, EnhancedDOMTreeNode, EnhancedSnapshotNode, NodeType, SerializedDOMState
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.views import ChatInvokeCompletion
+from browser_use.tools.service import Tools
 
 
 def node(index=1, tag='button', attributes=None, children=None):
@@ -258,7 +261,7 @@ async def test_native_select_mapping():
 	'operation,expected',
 	[
 		('scroll_up', {'scroll': {'down': False, 'pages': 1.0}}),
-		('wait', {'wait': {'seconds': 1}}),
+		('wait', {'wait': {'seconds': 2}}),
 	],
 )
 async def test_native_nonindexed_mapping(operation, expected):
@@ -273,6 +276,95 @@ async def test_action_failure_stops_without_retry():
 	assert (await a.run(10)).status == 'action_error'
 	assert len(model.requests) == 1
 	cast(AsyncMock, a.tools.act).assert_awaited_once()
+
+
+@pytest.mark.parametrize('missing_node', [False, True])
+async def test_native_dropdown_failure_stops_without_retry(missing_node):
+	a, browser, model = agent('select', {1: node(tag='select', children=[option(2, 'Blue', 'blue')])})
+	a.tools = Tools()
+	browser.get_element_by_index.return_value = None if missing_node else node(tag='select')
+	event = SimpleNamespace(
+		event_result=AsyncMock(
+			return_value={
+				'success': 'false',
+				'error': 'Selection was reverted by the page.',
+				'short_term_memory': 'Available options: Blue',
+				'long_term_memory': 'Could not select Blue',
+			}
+		)
+	)
+	dispatch = Mock(return_value=event)
+	browser.event_bus = SimpleNamespace(dispatch=dispatch)
+	assert (await a.run(2)).status == 'action_error'
+	assert len(model.requests) == 1
+	assert dispatch.call_count == (0 if missing_node else 1)
+
+
+@pytest.mark.parametrize('operation', ['click', 'input'])
+async def test_native_missing_target_stops_without_retry(operation):
+	llm = AsyncMock(spec=BaseChatModel)
+	llm.ainvoke.return_value = ChatInvokeCompletion(completion=FieldText(text='Ada'), usage=None)
+	a, browser, model = agent(operation, {1: node(tag='input' if operation == 'input' else 'button')}, llm)
+	a.tools = Tools()
+	browser.get_element_by_index.return_value = None
+	assert (await a.run(2)).status == 'action_error'
+	assert len(model.requests) == 1
+
+
+async def test_native_scroll_failure_stops_without_retry():
+	a, browser, model = agent('scroll_down')
+	a.tools = Tools()
+	browser.get_or_create_cdp_session.side_effect = RuntimeError('No viewport metrics')
+
+	class FailedScroll:
+		def __await__(self):
+			async def fail():
+				raise RuntimeError('Scroll failed after dispatch')
+
+			return fail().__await__()
+
+	dispatch = Mock(return_value=FailedScroll())
+	browser.event_bus = SimpleNamespace(dispatch=dispatch)
+	assert (await a.run(2)).status == 'action_error'
+	assert len(model.requests) == 1
+	dispatch.assert_called_once()
+
+
+async def test_native_wait_actually_sleeps_one_second(monkeypatch):
+	a, _, _ = agent('wait')
+	a.tools = Tools()
+	sleep = AsyncMock()
+	monkeypatch.setattr('browser_use.tools.service.asyncio.sleep', sleep)
+	assert (await a.run(1)).status == 'max_steps'
+	sleep.assert_awaited_once_with(1)
+
+
+def test_freshness_ignores_new_node_markers_but_keeps_real_text():
+	a, _, _ = agent()
+
+	def capture(index, previous=None, text='Ready'):
+		child = node(index + 100, '#text')
+		child.node_type = NodeType.TEXT_NODE
+		child.node_value = text
+		button = node(index, children=[child])
+		button.snapshot_node = EnhancedSnapshotNode(
+			True, 'pointer', DOMRect(0, 0, 100, 20), DOMRect(0, 0, 100, 20), None, {}, 0, 0
+		)
+		serialized, _ = DOMTreeSerializer(
+			button, previous_cached_state=previous, enable_bbox_filtering=False, paint_order_filtering=False
+		).serialize_accessible_elements()
+		result = state()
+		result.dom_state = serialized
+		return result
+
+	old = capture(1)
+	first = capture(2, old.dom_state)
+	second = capture(2, first.dom_state)
+	assert first.dom_state.llm_representation() != second.dom_state.llm_representation()
+	assert a._fingerprint(first) == a._fingerprint(second)
+	assert '*' in first.dom_state.llm_representation()  # Fingerprinting must not mutate observations.
+	changed = capture(2, second.dom_state, text='Changed')
+	assert a._fingerprint(second) != a._fingerprint(changed)
 
 
 async def test_done_is_declaration_and_can_be_independently_verified():

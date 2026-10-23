@@ -5,6 +5,7 @@ import json
 import os
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, Validat
 
 from browser_use.browser import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
-from browser_use.dom.views import EnhancedDOMTreeNode, NodeType
+from browser_use.dom.views import EnhancedDOMTreeNode, NodeType, SerializedDOMState, SimplifiedNode
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.tools.service import Tools
@@ -292,6 +293,12 @@ class MicrosoftDecisionAgent:
 		return bounded
 
 	def _fingerprint(self, state: BrowserStateSummary) -> str:
+		def without_history(node: SimplifiedNode) -> SimplifiedNode:
+			return replace(node, is_new=False, children=[without_history(child) for child in node.children])
+
+		# New-node markers change between observations even when the page is unchanged.
+		root = state.dom_state._root
+		stable_dom = SerializedDOMState(without_history(root) if root else None, state.dom_state.selector_map)
 		# Include descendants: select option values can change without changing visible text.
 		identities = []
 		pending = list(state.dom_state.selector_map.values())
@@ -323,7 +330,7 @@ class MicrosoftDecisionAgent:
 			str(self.browser.agent_focus_target_id),
 			state.url,
 			state.title,
-			state.dom_state.llm_representation(),
+			stable_dom.llm_representation(),
 			[(str(t.target_id), t.url, t.title) for t in state.tabs],
 			[
 				(
@@ -448,7 +455,8 @@ class MicrosoftDecisionAgent:
 				elif operation.startswith('scroll_'):
 					params = {'down': operation == 'scroll_down', 'pages': 1}
 				elif operation == 'wait':
-					params = {'seconds': 1}
+					# Native Tools.wait subtracts one second for the preceding model call.
+					params = {'seconds': 2}
 				current = await self.browser.get_browser_state_summary(include_screenshot=False, cached=False)
 				if self._fingerprint(current) != fingerprint:
 					return DecisionRunResult(status='stale_state', steps=steps)
