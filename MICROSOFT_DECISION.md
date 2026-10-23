@@ -89,6 +89,8 @@ The callback runs only after DONE. A false result remains `verified=False` even 
 
 ## Handle bounded execution
 
+Both backends receive the current value of supported non-secret text fields and the current label of native select fields. Values longer than 160 characters are marked as truncated in target descriptions. This helps the model move on from completed inputs and selections; use an outcome verifier to check the actual result.
+
 Each step sends one decision request containing an operation question and compatible target questions. The agent retains at most 250 targets in total, within a shared UTF-8 description budget. It retains click targets first, then input targets, then native select options, preserving observed order within each group. Other targets are unavailable for that step. Both backends require at least two candidates, so the agent resolves a sole compatible target locally. Only the selected operation's target answer can affect execution. A refusal for an unused target is ignored; a missing, refused, or invalid required answer stops the run before execution. Duplicate or unknown OpenAI answer names and duplicate probability values are rejected.
 
 The agent checks the complete current URL, focus, DOM text, and observed node identities again after prediction and text generation. A changed observation returns `stale_state` without executing the selected action. Browser mutations are never retried. An action error stops the run with `action_error`; inspect the page before starting another run because the action may have partially completed.

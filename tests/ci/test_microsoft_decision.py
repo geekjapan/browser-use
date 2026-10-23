@@ -15,7 +15,15 @@ from browser_use.browser import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.decision import ChoiceAnswer, ChoiceQuestion, DecisionRequest, DecisionResponse, FieldText
 from browser_use.dom.serializer.serializer import DOMTreeSerializer
-from browser_use.dom.views import DOMRect, EnhancedAXNode, EnhancedDOMTreeNode, EnhancedSnapshotNode, NodeType, SerializedDOMState
+from browser_use.dom.views import (
+	DOMRect,
+	EnhancedAXNode,
+	EnhancedAXProperty,
+	EnhancedDOMTreeNode,
+	EnhancedSnapshotNode,
+	NodeType,
+	SerializedDOMState,
+)
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.views import ChatInvokeCompletion
 from browser_use.tools.service import Tools
@@ -725,3 +733,122 @@ async def test_openai_native_agent_ignores_unused_refusal(monkeypatch):
 	a.decision_model = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handle))
 	assert (await a.run(1)).steps[0].operation == 'wait'
 	sleep.assert_awaited_once_with(1)
+
+
+@pytest.mark.parametrize('provider', ['azure', 'openai'])
+@pytest.mark.parametrize(
+	'operation,expected',
+	[
+		('click', {'click': {'index': 2}}),
+		('input', {'input': {'index': 2, 'text': 'Ada', 'clear': True}}),
+		('select', {'select_dropdown': {'index': 1, 'text': 'cyan'}}),
+		('scroll_up', {'scroll': {'down': False, 'pages': 1.0}}),
+		('scroll_down', {'scroll': {'down': True, 'pages': 1.0}}),
+		('wait', {'wait': {'seconds': 2}}),
+		('DONE', None),
+		('BLOCKED', None),
+	],
+)
+async def test_provider_parity_from_wire_response_to_native_action(provider, operation, expected):
+	from browser_use import OpenAIDecisionClient
+
+	nodes = {1: node(), 2: node(2)}
+	if operation == 'input':
+		nodes = {1: node(tag='input'), 2: node(2, 'input')}
+	elif operation == 'select':
+		nodes = {1: node(tag='select', children=[option(2, 'Red', 'blue'), option(3, 'Blue', 'cyan')])}
+	llm = AsyncMock(spec=BaseChatModel)
+	llm.ainvoke.return_value = ChatInvokeCompletion(completion=FieldText(text='Ada'), usage=None)
+	a, browser, _ = agent(operation, nodes, llm)
+	requests = []
+
+	def handle(request):
+		body = json.loads(request.content)
+		requests.append(body)
+		questions = (
+			{q['name']: {c['value']: c['description'] for c in q['choices']} for q in body['questions']}
+			if provider == 'openai'
+			else {name: q['criteria'] for name, q in body['questions'].items()}
+		)
+		selected = {'operation': operation, 'click_target': '2', 'input_target': '2', 'select_target': '1:1'}
+		answers = {name: answer(selected[name], candidates) for name, candidates in questions.items()}
+		if provider == 'openai':
+			payload = [
+				{
+					**value,
+					'name': name,
+					'probabilities': [{'value': key, 'probability': p} for key, p in value['probabilities'].items()],
+				}
+				for name, value in answers.items()
+			]
+		else:
+			payload = answers
+		return httpx.Response(200, json={'model': 'test-model', 'answers': payload})
+
+	transport = httpx.MockTransport(handle)
+	a.decision_model = (
+		OpenAIDecisionClient(api_key='offline-key', transport=transport)
+		if provider == 'openai'
+		else AzureMicrosoftDecisionClient('https://resource.test', api_key='offline-key', transport=transport)
+	)
+	verify = AsyncMock(return_value=True)
+	result = await a.run(1, outcome_verifier=verify)
+	assert len(requests) == 1
+	assert result.steps[0].operation == operation
+	browser.stop.assert_not_awaited()
+	if expected is None:
+		cast(AsyncMock, a.tools.act).assert_not_awaited()
+		assert result.status == ('model_done' if operation == 'DONE' else 'blocked')
+		assert result.verified is (True if operation == 'DONE' else None)
+	else:
+		cast(AsyncMock, a.tools.act).assert_awaited_once()
+		assert cast(AsyncMock, a.tools.act).call_args.args[0].model_dump(exclude_unset=True) == expected
+		assert result.status == 'max_steps'
+
+
+@pytest.mark.parametrize('value', [None, '', 'Ada'])
+@pytest.mark.parametrize('multiple', [False, True])
+def test_input_candidates_show_current_value(value, multiple):
+	attributes = {'name': 'first_name'}
+	if value is not None:
+		attributes['value'] = value
+	nodes = {1: node(tag='input', attributes=attributes)}
+	if multiple:
+		nodes[2] = node(2, 'textarea', {'name': 'notes', 'value': 'Existing notes'})
+	a, _, _ = agent(nodes=nodes, text_llm=AsyncMock(spec=BaseChatModel))
+	observed = state(nodes)
+	request = a._request(observed, a._targets(observed), [])
+	description = (
+		request.questions['input_target'].criteria['1']
+		if multiple
+		else json.loads(request.model_dump_json())['state']['sole_targets']['input']['1']
+	)
+	assert json.loads(description)['current_value'] == value
+	assert 'already satisfies' in request.questions['operation'].instructions
+
+
+@pytest.mark.parametrize('tag', ['input', 'textarea', 'select'])
+def test_long_current_value_keeps_target_available(tag):
+	field = node(tag=tag, attributes={'value': '界' * 20000})
+	if tag == 'select':
+		field.children_nodes = [option(2, 'Red', 'red'), option(3, 'Blue', 'cyan')]
+		field.ax_node = EnhancedAXNode(
+			'1', False, 'combobox', 'Color', None, properties=[EnhancedAXProperty('valuetext', '界' * 20000)], child_ids=None
+		)
+	a, _, _ = agent(nodes={1: field}, text_llm=AsyncMock(spec=BaseChatModel))
+	targets = a._targets(state({1: field}))['select' if tag == 'select' else 'input']
+	assert len(targets) == (2 if tag == 'select' else 1)
+	for target in targets.values():
+		description = target.description.split(': label=', 1)[0]
+		assert json.loads(description)['current_value'] == '界' * 160
+		assert json.loads(description)['current_value_truncated'] is True
+
+
+def test_select_candidates_show_current_label_from_accessibility_state():
+	field = node(tag='select', children=[option(2, 'Red', 'red'), option(3, 'Blue', 'cyan')])
+	field.ax_node = EnhancedAXNode(
+		'1', False, 'combobox', 'Color', None, properties=[EnhancedAXProperty('valuetext', 'Blue')], child_ids=None
+	)
+	a, _, _ = agent(nodes={1: field})
+	for target in a._targets(state({1: field}))['select'].values():
+		assert json.loads(target.description.split(': label=', 1)[0])['current_value'] == 'Blue'

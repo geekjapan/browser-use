@@ -17,6 +17,8 @@ PAGE = """<!DOCTYPE html>
 	<input id="name" type="text" placeholder="Your name">
 	<label for="notes">Notes</label>
 	<textarea id="notes"></textarea>
+	<label for="color">Color</label>
+	<select id="color"><option value="red">Red</option><option value="cyan">Blue</option></select>
 	<input id="secret" type="password">
 	<input id="otp" type="text" autocomplete="one-time-code">
 	<input id="card" type="text" autocomplete="cc-number">
@@ -25,6 +27,7 @@ PAGE = """<!DOCTYPE html>
 	<script>
 		document.getElementById('name').value = 'Ada Lovelace';
 		document.getElementById('notes').value = 'call back tuesday';
+		document.getElementById('color').value = 'cyan';
 		document.getElementById('secret').value = 'hunter2';
 		document.getElementById('otp').value = '493021';
 		document.getElementById('card').value = '4242424242424242';
@@ -36,7 +39,7 @@ PAGE = """<!DOCTYPE html>
 
 @pytest.fixture(scope='module')
 def http_server():
-	server = HTTPServer()
+	server = HTTPServer(threaded=True)
 	server.start()
 	server.expect_request('/prefilled').respond_with_data(PAGE, content_type='text/html')
 	yield server
@@ -63,6 +66,7 @@ async def test_live_input_values_reach_the_agent(browser_session, http_server):
 	llm_view = state.dom_state.llm_representation()
 	assert 'Ada Lovelace' in llm_view
 	assert 'call back tuesday' in llm_view
+	assert 'value=Blue' in llm_view, 'the model must see the selected label, not only the option list'
 	assert 'hunter2' not in llm_view
 	assert '493021' not in llm_view
 	assert '4242424242424242' not in llm_view
