@@ -791,6 +791,14 @@ class DomService:
 			ax_node = ax_tree_lookup.get(node['backendNodeId'])
 			if ax_node:
 				enhanced_ax_node = self._build_enhanced_ax_node(ax_node)
+				# Native selects expose their current label as an AX value, outside properties.
+				if node['nodeName'].upper() == 'SELECT':
+					select_value = ax_node.get('value', {}).get('value')
+					if isinstance(select_value, str):
+						properties = enhanced_ax_node.properties or []
+						if not any(prop.name == 'valuetext' for prop in properties):
+							properties.append(EnhancedAXProperty(name='valuetext', value=select_value))
+						enhanced_ax_node.properties = properties
 			else:
 				enhanced_ax_node = None
 
