@@ -1,0 +1,228 @@
+[
+  {
+    "id": "API-AZURE",
+    "scope": "Azure authentication, endpoint and error handling",
+    "tests": [
+      "test_http_contract_and_auth",
+      "test_endpoint_validation",
+      "test_azure_choice_uses_deployment_and_preserves_observed_target",
+      "test_entra_token_authentication"
+    ]
+  },
+  {
+    "id": "API-OPENAI",
+    "scope": "OpenAI wire format, model, answer names and identities",
+    "tests": [
+      "test_openai_http_contract_and_environment",
+      "test_wire_contract_and_evidence",
+      "test_openai_rejects_duplicate_heads"
+    ]
+  },
+  {
+    "id": "API-ERROR",
+    "scope": "Provider failures, redaction, rate limits and retry policy",
+    "tests": [
+      "test_provider_errors_are_sanitized_and_not_retried",
+      "test_openai_http_errors_are_sanitized_without_retries",
+      "test_retry_policy_exact_attempts",
+      "test_rate_limit_stops_without_repeating_an_old_observation"
+    ]
+  },
+  {
+    "id": "CHOICE",
+    "scope": "Exact candidate, finite probabilities and confidence domain",
+    "tests": [
+      "test_exhaustive_choice_domain",
+      "test_invalid_choice_is_rejected"
+    ]
+  },
+  {
+    "id": "OPERATIONS",
+    "scope": "Both providers and engines: all eight finite operations",
+    "tests": [
+      "test_provider_parity_from_wire_response_to_native_action",
+      "test_provider_operation_parity",
+      "test_both_engines_all_operations"
+    ]
+  },
+  {
+    "id": "TARGETS",
+    "scope": "Selected-head isolation and singleton resolution",
+    "tests": [
+      "test_only_selected_target_head_is_consumed",
+      "test_all_heads_are_one_request_and_only_matching_head_executes",
+      "test_only_available_target_is_resolved_without_a_target_question",
+      "test_openai_invalid_required_head_never_acts"
+    ]
+  },
+  {
+    "id": "CONSUMPTION",
+    "scope": "At most one attempt per pending Jev prediction",
+    "tests": [
+      "test_exhaustive_single_consumption",
+      "test_jev_replay_after_callback_failure"
+    ]
+  },
+  {
+    "id": "FRESHNESS",
+    "scope": "Changes before execution reject obsolete decisions",
+    "tests": [
+      "test_browser_freshness_interleavings",
+      "test_stale_decision_is_consumed_before_any_mutation",
+      "test_navigation_during_prediction_reobserves_without_action"
+    ]
+  },
+  {
+    "id": "NATIVE-GUARDS",
+    "scope": "Real DOM identity, state, overlay, geometry and autocomplete guards",
+    "tests": [
+      "test_existing_harness_guard_suite"
+    ]
+  },
+  {
+    "id": "NATIVE-SELECT",
+    "scope": "Native select mapping including Unicode whitespace collisions",
+    "tests": [
+      "test_select_candidates_against_native_javascript",
+      "test_unicode_select_target_in_full_native_path"
+    ]
+  },
+  {
+    "id": "DOM-VALUES",
+    "scope": "Live field and select values; password, OTP and card fixture masking",
+    "tests": [
+      "test_live_input_values_reach_the_agent",
+      "test_input_candidates_show_current_value",
+      "test_long_current_value_keeps_target_available"
+    ]
+  },
+  {
+    "id": "DOM-ROLES",
+    "scope": "Supported ARIA roles, editable/read-only/hidden/inert/disabled fields",
+    "tests": [
+      "test_harness_roles_and_snapshot_budgets"
+    ]
+  },
+  {
+    "id": "BOUNDS",
+    "scope": "Context, target and observation bounds",
+    "tests": [
+      "test_context_limit_and_candidate_limit",
+      "test_long_dom_is_bounded_without_changing_target_ids",
+      "test_harness_roles_and_snapshot_budgets"
+    ]
+  },
+  {
+    "id": "STEP-LIMITS",
+    "scope": "Jev action/model-call limits and no-progress termination",
+    "tests": [
+      "test_jev_action_and_prediction_budgets",
+      "test_loading_waits_do_not_trigger_no_progress_stop",
+      "test_jev_no_progress_stops_after_three_actions",
+      "test_browser_step_budget",
+      "test_browser_invalid_budget_never_starts"
+    ]
+  },
+  {
+    "id": "HELPER",
+    "scope": "Lazy separate text helper, schema and length limits",
+    "tests": [
+      "test_input_helper_is_lazy_strict_and_rechecks_state",
+      "test_helper_output_boundary",
+      "test_helper_maximum_length",
+      "test_text_helper_rejects_invalid_values"
+    ]
+  },
+  {
+    "id": "HELPER-CACHE",
+    "scope": "Reuse text only under identical retry input",
+    "tests": [
+      "test_generated_text_reused_only_for_identical_retry_context",
+      "test_changed_field_context_does_not_reuse_generated_text"
+    ]
+  },
+  {
+    "id": "LIFECYCLE",
+    "scope": "Borrowed/owned browser and loop completion semantics",
+    "tests": [
+      "test_owned_browser_stops_even_after_prediction_failure",
+      "test_singleton_native_click_and_borrowed_browser",
+      "test_jev_terminal_requires_fresh_state",
+      "test_reset_validation_and_old_browser_lifecycle"
+    ]
+  },
+  {
+    "id": "OUTCOME",
+    "scope": "DONE is a declaration; verify actual result independently",
+    "tests": [
+      "test_done_is_declaration_and_can_be_independently_verified",
+      "test_both_engines_all_operations",
+      "test_flight_verification_rejects_wrong_trip"
+    ]
+  },
+  {
+    "id": "HISTORY",
+    "scope": "Log execution before later observation errors; capture frames",
+    "tests": [
+      "test_stale_observation_preserves_executed_action",
+      "test_both_engines_all_operations"
+    ]
+  },
+  {
+    "id": "DEMO-AUTH",
+    "scope": "Loopback Host/Origin/token combinations",
+    "tests": [
+      "test_all_host_origin_token_combinations"
+    ]
+  },
+  {
+    "id": "DEMO-LOCK",
+    "scope": "Concurrent commands rejected and locks released on bad input/error",
+    "tests": [
+      "test_busy_lock_is_rejected_without_running_command",
+      "test_bad_body_releases_lock",
+      "test_internal_error_redacted_and_lock_released"
+    ]
+  },
+  {
+    "id": "DEMO-STATIC",
+    "scope": "Static MIME, no-store, nosniff, token substitution and path rejection",
+    "tests": [
+      "test_static_response_headers_and_token"
+    ]
+  },
+  {
+    "id": "UI-CONTROLS",
+    "scope": "Inspector start/choose/execute/auto/stop, failure recovery and overlays",
+    "stages": [
+      "ui"
+    ]
+  },
+  {
+    "id": "UI-TRACE",
+    "scope": "Escaped display, singleton ranking and trace download",
+    "stages": [
+      "ui",
+      "existing-ui"
+    ]
+  },
+  {
+    "id": "PACKAGING",
+    "scope": "Both wheels, runtime assets and Jev CLI entrypoint",
+    "stages": [
+      "build-jev",
+      "build-browser-use",
+      "wheel-content"
+    ]
+  },
+  {
+    "id": "REPORT",
+    "scope": "Skipped, missing and failed checks cannot become reported coverage",
+    "tests": [
+      "test_junit_pass_skip_failure_and_error",
+      "test_every_parameter_must_pass",
+      "test_stage_must_have_completed_successfully",
+      "test_unmapped_skip_also_blocks_overall_success"
+    ]
+  }
+]

@@ -15,7 +15,15 @@ from browser_use.browser import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.decision import ChoiceAnswer, ChoiceQuestion, DecisionRequest, DecisionResponse, FieldText
 from browser_use.dom.serializer.serializer import DOMTreeSerializer
-from browser_use.dom.views import DOMRect, EnhancedAXNode, EnhancedDOMTreeNode, EnhancedSnapshotNode, NodeType, SerializedDOMState
+from browser_use.dom.views import (
+	DOMRect,
+	EnhancedAXNode,
+	EnhancedAXProperty,
+	EnhancedDOMTreeNode,
+	EnhancedSnapshotNode,
+	NodeType,
+	SerializedDOMState,
+)
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.views import ChatInvokeCompletion
 from browser_use.tools.service import Tools
@@ -527,6 +535,18 @@ def test_select_match_strings_resolve_to_exact_observed_option(options, expected
 		)
 
 
+@pytest.mark.parametrize('disabled', [False, True])
+def test_select_bom_label_collision_excludes_ambiguous_target(disabled):
+	first = option(2, '\ufeffB\ufeff', '\ufeffB\ufeff')
+	first.attributes.pop('value')
+	if disabled:
+		first.attributes['disabled'] = ''
+	a, _, _ = agent()
+	targets = a._targets(state({1: node(tag='select', children=[first, option(3, 'B', 'b')])})).get('select', {})
+	assert '1:1' not in targets
+	assert ('1:0' in targets) is (not disabled)
+
+
 async def test_select_label_value_collision_uses_safe_value_in_native_action():
 	a, _, _ = agent(
 		'select', {1: node(tag='select', children=[option(2, 'Red', 'blue'), option(3, 'Blue', 'cyan')])}, target='1:1'
@@ -535,3 +555,394 @@ async def test_select_label_value_collision_uses_safe_value_in_native_action():
 	assert cast(AsyncMock, a.tools.act).call_args.args[0].model_dump(exclude_unset=True) == {
 		'select_dropdown': {'index': 1, 'text': 'cyan'}
 	}
+
+
+def openai_request():
+	return DecisionRequest(
+		model='azure-model-is-not-used',
+		state={'url': 'https://example.test', 'task': 'Finish'},
+		questions={'operation': ChoiceQuestion(instructions='Choose', criteria={'DONE': 'Done', 'BLOCKED': 'Blocked'})},
+	)
+
+
+def openai_answer(name='operation', choice='DONE', candidates=('DONE', 'BLOCKED')):
+	value = answer(choice, candidates)
+	value['name'] = name
+	value['probabilities'] = [{'value': key, 'probability': probability} for key, probability in value['probabilities'].items()]
+	return value
+
+
+async def test_openai_http_contract_and_environment(monkeypatch):
+	from browser_use import DecisionAgent, OpenAIDecisionClient
+
+	assert DecisionAgent is MicrosoftDecisionAgent
+	monkeypatch.setenv('OPENAI_API_KEY', 'key-secret')
+	monkeypatch.setenv('OPENAI_DECISION_MODEL', 'configured-model')
+
+	def handle(request):
+		assert str(request.url) == 'https://api.openai.com/v1/decisions'
+		assert request.headers['Authorization'] == 'Bearer key-secret'
+		body = json.loads(request.content)
+		assert body == {
+			'model': 'configured-model',
+			'input': json.dumps(openai_request().state, ensure_ascii=False, sort_keys=True),
+			'questions': [
+				{
+					'name': 'operation',
+					'type': 'choice',
+					'instructions': 'Choose',
+					'choices': [{'value': 'DONE', 'description': 'Done'}, {'value': 'BLOCKED', 'description': 'Blocked'}],
+				}
+			],
+		}
+		return httpx.Response(200, json={'model': 'configured-model', 'answers': [openai_answer()], 'usage': {'total_tokens': 5}})
+
+	client = OpenAIDecisionClient(transport=httpx.MockTransport(handle))
+	response = await client.predict(openai_request())
+	assert (
+		ChoiceAnswer.validate_for(response.answers['operation'], openai_request().questions['operation'].criteria).choice
+		== 'DONE'
+	)
+	monkeypatch.delenv('OPENAI_DECISION_MODEL')
+	assert OpenAIDecisionClient().model == 'gpt-6-luna'
+	assert OpenAIDecisionClient(model='explicit-model').model == 'explicit-model'
+	assert 'key-secret' not in repr(client.__dict__)
+
+
+@pytest.mark.parametrize('status', [302, 400, 401, 429, 503])
+async def test_openai_http_errors_are_sanitized_without_retries(status):
+	from browser_use import OpenAIDecisionClient
+
+	calls = []
+
+	def handle(request):
+		calls.append(request)
+		return httpx.Response(status, text='secret provider response')
+
+	client = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handle))
+	with pytest.raises(RuntimeError) as error:
+		await client.predict(openai_request())
+	assert 'secret' not in str(error.value)
+	assert len(calls) == 1
+
+
+async def test_openai_missing_auth_network_and_invalid_json(monkeypatch):
+	from browser_use import OpenAIDecisionClient
+
+	monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+	with pytest.raises(ValueError, match='OPENAI_API_KEY'):
+		OpenAIDecisionClient()
+
+	def fail(request):
+		raise httpx.ConnectError('secret network detail', request=request)
+
+	for handler, exception in [
+		(fail, RuntimeError),
+		(lambda request: httpx.Response(200, text='secret invalid JSON'), ValueError),
+	]:
+		client = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handler))
+		with pytest.raises(exception) as error:
+			await client.predict(openai_request())
+		assert 'secret' not in str(error.value)
+
+
+@pytest.mark.parametrize(
+	'change',
+	[
+		{'name': 12},
+		{'name': 'unknown'},
+		{'type': 'score'},
+		{'choice': 1},
+		{'choice': None},
+		{'confidence': True},
+		{'confidence': '0.8'},
+		{'confidence': None},
+		{'probabilities': None},
+		{'probabilities': [{'value': 'DONE', 'probability': True}]},
+		{'probabilities': [{'value': 1, 'probability': 1.0}]},
+		{'probabilities': [{'value': 'DONE', 'probability': 1.0}, {'value': 'DONE', 'probability': 0.0}]},
+	],
+)
+async def test_openai_rejects_malformed_named_answers(change):
+	from browser_use import OpenAIDecisionClient
+
+	client = OpenAIDecisionClient(
+		api_key='secret',
+		transport=httpx.MockTransport(
+			lambda request: httpx.Response(200, json={'model': 'gpt-6-luna', 'answers': [openai_answer() | change]})
+		),
+	)
+	with pytest.raises(ValueError, match='Invalid OpenAI Decisions response'):
+		await client.predict(openai_request())
+
+
+async def test_openai_rejects_duplicate_heads():
+	from browser_use import OpenAIDecisionClient
+
+	client = OpenAIDecisionClient(
+		api_key='secret',
+		transport=httpx.MockTransport(
+			lambda request: httpx.Response(200, json={'model': 'gpt-6-luna', 'answers': [openai_answer(), openai_answer()]})
+		),
+	)
+	with pytest.raises(ValueError, match='Invalid OpenAI Decisions response'):
+		await client.predict(openai_request())
+
+
+@pytest.mark.parametrize('kind', ['missing', 'refusal', 'unknown_choice', 'bad_probabilities'])
+@pytest.mark.parametrize('head', ['operation', 'click_target'])
+async def test_openai_invalid_required_head_never_acts(kind, head):
+	from browser_use import OpenAIDecisionClient
+
+	a, _, _ = agent('click', {1: node(), 2: node(2)})
+
+	def handle(request):
+		questions = json.loads(request.content)['questions']
+		answers = [
+			openai_answer(q['name'], 'click' if q['name'] == 'operation' else '2', [c['value'] for c in q['choices']])
+			for q in questions
+		]
+		for index, value in enumerate(answers):
+			if value['name'] == head:
+				if kind == 'missing':
+					answers.pop(index)
+				elif kind == 'refusal':
+					answers[index] = {'name': head, 'type': 'refusal'}
+				elif kind == 'unknown_choice':
+					value['choice'] = 'invented'
+				else:
+					value['probabilities'] = [{'value': 'invented', 'probability': 1.0}]
+				break
+		return httpx.Response(200, json={'model': 'gpt-6-luna', 'answers': answers})
+
+	a.decision_model = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handle))
+	with pytest.raises(ValueError, match='Invalid Decision'):
+		await a.run(1)
+	cast(AsyncMock, a.tools.act).assert_not_awaited()
+
+
+async def test_openai_native_agent_ignores_unused_refusal(monkeypatch):
+	from browser_use import OpenAIDecisionClient
+
+	a, _, _ = agent('wait', {1: node(), 2: node(2)})
+	a.tools = Tools()
+	sleep = AsyncMock()
+	monkeypatch.setattr('browser_use.tools.service.asyncio.sleep', sleep)
+
+	def handle(request):
+		questions = json.loads(request.content)['questions']
+		return httpx.Response(
+			200,
+			json={
+				'model': 'gpt-6-luna',
+				'answers': [
+					openai_answer('operation', 'wait', [c['value'] for c in questions[0]['choices']]),
+					{'name': 'click_target', 'type': 'refusal'},
+				],
+			},
+		)
+
+	a.decision_model = OpenAIDecisionClient(api_key='secret', transport=httpx.MockTransport(handle))
+	assert (await a.run(1)).steps[0].operation == 'wait'
+	sleep.assert_awaited_once_with(1)
+
+
+@pytest.mark.parametrize('provider', ['azure', 'openai'])
+@pytest.mark.parametrize(
+	'operation,expected',
+	[
+		('click', {'click': {'index': 2}}),
+		('input', {'input': {'index': 2, 'text': 'Ada', 'clear': True}}),
+		('select', {'select_dropdown': {'index': 1, 'text': 'cyan'}}),
+		('scroll_up', {'scroll': {'down': False, 'pages': 1.0}}),
+		('scroll_down', {'scroll': {'down': True, 'pages': 1.0}}),
+		('wait', {'wait': {'seconds': 2}}),
+		('DONE', None),
+		('BLOCKED', None),
+	],
+)
+async def test_provider_parity_from_wire_response_to_native_action(provider, operation, expected):
+	from browser_use import OpenAIDecisionClient
+
+	nodes = {1: node(), 2: node(2)}
+	if operation == 'input':
+		nodes = {1: node(tag='input'), 2: node(2, 'input')}
+	elif operation == 'select':
+		nodes = {1: node(tag='select', children=[option(2, 'Red', 'blue'), option(3, 'Blue', 'cyan')])}
+	llm = AsyncMock(spec=BaseChatModel)
+	llm.ainvoke.return_value = ChatInvokeCompletion(completion=FieldText(text='Ada'), usage=None)
+	a, browser, _ = agent(operation, nodes, llm)
+	requests = []
+
+	def handle(request):
+		body = json.loads(request.content)
+		requests.append(body)
+		questions = (
+			{q['name']: {c['value']: c['description'] for c in q['choices']} for q in body['questions']}
+			if provider == 'openai'
+			else {name: q['criteria'] for name, q in body['questions'].items()}
+		)
+		selected = {'operation': operation, 'click_target': '2', 'input_target': '2', 'select_target': '1:1'}
+		answers = {name: answer(selected[name], candidates) for name, candidates in questions.items()}
+		if provider == 'openai':
+			payload = [
+				{
+					**value,
+					'name': name,
+					'probabilities': [{'value': key, 'probability': p} for key, p in value['probabilities'].items()],
+				}
+				for name, value in answers.items()
+			]
+		else:
+			payload = answers
+		return httpx.Response(200, json={'model': 'test-model', 'answers': payload})
+
+	transport = httpx.MockTransport(handle)
+	a.decision_model = (
+		OpenAIDecisionClient(api_key='offline-key', transport=transport)
+		if provider == 'openai'
+		else AzureMicrosoftDecisionClient('https://resource.test', api_key='offline-key', transport=transport)
+	)
+	verify = AsyncMock(return_value=True)
+	result = await a.run(1, outcome_verifier=verify)
+	assert len(requests) == 1
+	assert result.steps[0].operation == operation
+	browser.stop.assert_not_awaited()
+	if expected is None:
+		cast(AsyncMock, a.tools.act).assert_not_awaited()
+		assert result.status == ('model_done' if operation == 'DONE' else 'blocked')
+		assert result.verified is (True if operation == 'DONE' else None)
+	else:
+		cast(AsyncMock, a.tools.act).assert_awaited_once()
+		assert cast(AsyncMock, a.tools.act).call_args.args[0].model_dump(exclude_unset=True) == expected
+		assert result.status == 'max_steps'
+
+
+@pytest.mark.parametrize('value', [None, '', 'Ada'])
+@pytest.mark.parametrize('multiple', [False, True])
+def test_input_candidates_show_current_value(value, multiple):
+	attributes = {'name': 'first_name'}
+	if value is not None:
+		attributes['value'] = value
+	nodes = {1: node(tag='input', attributes=attributes)}
+	if multiple:
+		nodes[2] = node(2, 'textarea', {'name': 'notes', 'value': 'Existing notes'})
+	a, _, _ = agent(nodes=nodes, text_llm=AsyncMock(spec=BaseChatModel))
+	observed = state(nodes)
+	request = a._request(observed, a._targets(observed), [])
+	description = (
+		request.questions['input_target'].criteria['1']
+		if multiple
+		else json.loads(request.model_dump_json())['state']['sole_targets']['input']['1']
+	)
+	assert json.loads(description)['current_value'] == value
+	assert 'already satisfies' in request.questions['operation'].instructions
+
+
+@pytest.mark.parametrize('tag', ['input', 'textarea', 'select'])
+def test_long_current_value_keeps_target_available(tag):
+	field = node(tag=tag, attributes={'value': '界' * 20000})
+	if tag == 'select':
+		field.children_nodes = [option(2, 'Red', 'red'), option(3, 'Blue', 'cyan')]
+		field.ax_node = EnhancedAXNode(
+			'1', False, 'combobox', 'Color', None, properties=[EnhancedAXProperty('valuetext', '界' * 20000)], child_ids=None
+		)
+	a, _, _ = agent(nodes={1: field}, text_llm=AsyncMock(spec=BaseChatModel))
+	targets = a._targets(state({1: field}))['select' if tag == 'select' else 'input']
+	assert len(targets) == (2 if tag == 'select' else 1)
+	for target in targets.values():
+		description = target.description.split(': label=', 1)[0]
+		assert json.loads(description)['current_value'] == '界' * 160
+		assert json.loads(description)['current_value_truncated'] is True
+
+
+def test_select_candidates_show_current_label_from_accessibility_state():
+	field = node(tag='select', children=[option(2, 'Red', 'red'), option(3, 'Blue', 'cyan')])
+	field.ax_node = EnhancedAXNode(
+		'1', False, 'combobox', 'Color', None, properties=[EnhancedAXProperty('valuetext', 'Blue')], child_ids=None
+	)
+	a, _, _ = agent(nodes={1: field})
+	for target in a._targets(state({1: field}))['select'].values():
+		assert json.loads(target.description.split(': label=', 1)[0])['current_value'] == 'Blue'
+
+
+class ScriptedRanker:
+	def __init__(self, preferred, *, drop=False):
+		self.preferred = preferred
+		self.drop = drop
+		self.calls = []
+
+	async def rank(self, task, candidates):
+		self.calls.append((task, dict(candidates)))
+		scores = {key: (1.0 if key in self.preferred else 0.0) for key in candidates}
+		if self.drop:
+			scores.pop(next(iter(scores)))
+		return scores
+
+
+def ranked_agent(nodes, ranker, operation='click', target=None):
+	browser = AsyncMock(spec=BrowserSession)
+	browser.agent_focus_target_id = 'target'
+	browser.get_browser_state_summary.return_value = state(nodes)
+	decision = ScriptedDecision(operation, target)
+	a = MicrosoftDecisionAgent(
+		'Enter Ada in the name field', decision, browser=browser, text_llm=AsyncMock(spec=BaseChatModel), target_ranker=ranker
+	)
+	a.tools.act = AsyncMock(return_value=ActionResult(extracted_content='ok'))
+	return a, decision
+
+
+async def test_target_ranker_keeps_relevant_targets_on_large_pages():
+	nodes = {i: node(i) for i in range(1, 401)}
+	nodes[401] = node(401, 'input', {'name': 'name'})
+	ranker = ScriptedRanker({'input:401', 'click:300'})
+	a, decision = ranked_agent(nodes, ranker, 'click', '300')
+	# Observed-order bounding alone spends the whole budget on earlier buttons.
+	assert 'input' not in a._targets(state(nodes))
+	result = await a.run(1)
+	assert result.steps[0].index == 300
+	((task, candidates),) = ranker.calls
+	assert task == 'Enter Ada in the name field' and len(candidates) == 401
+	questions = decision.requests[0].questions
+	# Ranked order still respects the shared candidate and byte budget.
+	assert next(iter(questions['click_target'].criteria)) == '300'
+	assert len(questions['click_target'].criteria) < len(a._targets(state(nodes))['click'])
+	assert decision.requests[0].state['sole_targets'] == {'input': {'401': candidates['input:401']}}
+
+
+async def test_target_ranker_input_is_capped_and_unranked_targets_follow():
+	nodes = {i: node(i) for i in range(1, 1201)}
+	nodes[1201] = node(1201, 'input', {'name': 'name'})
+	ranker = ScriptedRanker({'click:999'})
+	a, decision = ranked_agent(nodes, ranker, 'click', '999')
+	assert (await a.run(1)).steps[0].index == 999
+	# A late form field is still ranked; clicks fill the rest of the cap in observed order.
+	assert list(ranker.calls[0][1]) == ['input:1201'] + [f'click:{i}' for i in range(1, 1000)]
+	assert '1000' not in decision.requests[0].questions['click_target'].criteria
+
+
+async def test_target_ranker_skipped_when_all_targets_fit():
+	ranker = ScriptedRanker(set())
+	a, decision = ranked_agent({1: node(1), 2: node(2)}, ranker, 'click', '2')
+	assert (await a.run(1)).steps[0].index == 2
+	assert not ranker.calls and len(decision.requests) == 1
+
+
+async def test_invalid_target_ranking_stops_before_prediction():
+	ranker = ScriptedRanker(set(), drop=True)
+	a, decision = ranked_agent({i: node(i) for i in range(1, 300)}, ranker)
+	with pytest.raises(ValueError, match='no action executed'):
+		await a.run(1)
+	assert not decision.requests
+
+
+async def test_mediapipe_ranker_rejects_task_beyond_token_limit():
+	from browser_use.decision import MediaPipeTargetRanker
+
+	class UnusedMaker:
+		def evaluate_choice(self, text, question):
+			raise AssertionError('truncated context must not reach the model')
+
+	ranker = MediaPipeTargetRanker(maker=UnusedMaker(), max_num_tokens=128)
+	with pytest.raises(ValueError, match='token limit'):
+		await ranker.rank('x' * 200, {'a': 'A', 'b': 'B'})

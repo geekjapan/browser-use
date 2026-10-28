@@ -69,6 +69,8 @@ core = [
     "browser-use-core==0.13.3; sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
 ]
 aws = ["boto3==1.42.37"]
+# mediapipe: on-device target ranking for DecisionAgent (EmbeddingGemma 2 via MediaPipe Decision Maker)
+mediapipe = ["mediapipe==1.2.0"]
 oci = ["oci==2.166.0"]
 video = ["imageio[ffmpeg]==2.37.2", "numpy==2.4.1"]
 examples = [
