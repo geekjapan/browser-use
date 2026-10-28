@@ -31,12 +31,16 @@ repos:
       - id: ruff-check
         args: [ --fix ]
       - id: ruff-format
+        # jev-ultrafast/ is a separate uv project with its own ruff config and is not format-clean under it
+        exclude: ^jev-ultrafast/
       # see pyproject.toml for more details on ruff config
 
   - repo: https://github.com/RobertCraigie/pyright-python
     rev: v1.1.404
     hooks:
     - id: pyright
+      # the hook passes file names explicitly, bypassing [tool.pyright].include
+      exclude: ^jev-ultrafast/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

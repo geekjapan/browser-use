@@ -138,6 +138,8 @@ Run the offline contract and behavior tests with:
 uv run pytest tests/ci/test_microsoft_decision.py
 ```
 
+The verification suite for this agent and the `jev-ultrafast` runtime (bounded enumeration, mutation checks, real Chromium) lives in `jev-ultrafast/verification`; run `python3 verification/run.py` from `jev-ultrafast/`.
+
 The on-device ranker check needs the downloaded model, so it lives outside `tests/ci`:
 
 ```bash

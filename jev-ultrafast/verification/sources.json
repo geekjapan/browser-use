@@ -1,0 +1,29 @@
+{
+  "browser-use": [
+    "browser_use/decision.py",
+    "browser_use/dom/service.py",
+    "browser_use/dom/enhanced_snapshot.py",
+    "browser_use/dom/serializer/serializer.py",
+    "browser_use/browser/watchdogs/default_action_watchdog.py",
+    "pyproject.toml",
+    "uv.lock",
+    "tests/ci/test_microsoft_decision.py",
+    "tests/ci/test_dom_live_input_value.py"
+  ],
+  "jev-ultrafast": [
+    "jev_ultrafast/agent.py",
+    "jev_ultrafast/browser.py",
+    "jev_ultrafast/model.py",
+    "jev_ultrafast/questions.py",
+    "jev_ultrafast/snapshot.js",
+    "jev_ultrafast/demo.py",
+    "jev_ultrafast/static/app.js",
+    "pyproject.toml",
+    "uv.lock",
+    "tests/test_agent.py",
+    "tests/test_azure.py",
+    "tests/test_openai.py",
+    "tests/check_demo_ui.cjs",
+    "scripts/check_guards.py"
+  ]
+}
