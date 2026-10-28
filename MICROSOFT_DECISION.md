@@ -28,6 +28,10 @@ export OPENAI_DECISION_MODEL=gpt-6-luna
 
 `OpenAIDecisionClient()` sends `POST https://api.openai.com/v1/decisions` with bearer authentication. It defaults to `gpt-6-luna`; pass `model=` or set `OPENAI_DECISION_MODEL` to override it. The client sends the observed state as JSON text in `input`, with named choice questions. It does not retry requests or follow redirects.
 
+### Microsoft Foundry and Google Gemini
+
+`AzureMicrosoftDecisionClient` is the Microsoft Foundry client: Foundry serves `Microsoft-Decision-1` on the same `/providers/microsoft/v1/systemone` route, with your deployment name as `model`. The Gemini API and Google AI Studio have no decision endpoint, so there is no Gemini decision client. For Google models, use the on-device ranker below.
+
 In the example below, replace `AzureMicrosoftDecisionClient()` with `OpenAIDecisionClient()` and import `OpenAIDecisionClient` to use OpenAI. Both clients use the same agent and native browser guards. `MicrosoftDecisionAgent` remains an alias of `DecisionAgent` for existing imports.
 
 ## Run with an existing browser
@@ -69,6 +73,35 @@ Pass any configured `BaseChatModel` as `text_llm` to generate text for input fie
 
 When you supply `browser`, you retain ownership. When you omit it, the agent creates a local session and stops that session when the run ends. This agent has no navigation operation, so supplying a browser on the target page is the useful starting point.
 
+## Rank targets on device with an embedding model
+
+On pages with more targets than the request can hold, the agent keeps the first observed targets, so a relevant field late on the page can be unavailable. Pass a `target_ranker` to order all observed targets by relevance to the task before that cut. The decision model still chooses the operation and target; the ranker only decides which targets it sees. The ranker runs only when some targets would be dropped.
+
+`MediaPipeTargetRanker` runs MediaPipe Decision Maker locally with an EmbeddingGemma 2 model. Install the optional extra and download [`embeddinggemma-2-text-270m.litertlm`](https://huggingface.co/litert-community/embeddinggemma-2-text-270m-litert-lm) (165 MB, Apache-2.0):
+
+```bash
+uv add "browser-use[mediapipe]"
+```
+
+MediaPipe 1.2.0 publishes wheels for macOS arm64, Linux x86_64/aarch64 and Windows; there is no macOS x86_64 wheel.
+
+```python
+from browser_use import DecisionAgent, MediaPipeTargetRanker, OpenAIDecisionClient
+
+ranker = MediaPipeTargetRanker('embeddinggemma-2-text-270m.litertlm')
+try:
+	agent = DecisionAgent(task, decision_model=OpenAIDecisionClient(), browser=browser, target_ranker=ranker)
+	result = await agent.run(max_steps=10)
+finally:
+	ranker.close()
+```
+
+The ranker receives only the task text and the target descriptions; nothing leaves the machine. MediaPipe silently truncates context beyond `max_num_tokens` (default 2048), so a longer task raises an error instead. Pass `maker=` to reuse a `DecisionMaker` you configured; it remains yours to close, and `max_num_tokens` must match the value you built it with, or the guard cannot detect truncation. Target descriptions are not guarded; DecisionAgent already bounds them, and a truncated description only affects ranking. A ranking that omits a target or returns a non-finite score stops the run before prediction.
+
+Measured on an Apple Silicon CPU with synthetic product pages: with about 270 targets, the intended target ranked within the top 20 in 12 of 12 tasks. With about 600 targets, the description budget holds about 88 targets; the intended target was offered to the decision model in 4 of 6 tasks with the ranker and 1 of 6 without it. The two misses were form fields crowded out by similar product buttons. The first call embeds every target description (about 14 s for 270 targets, 37 s for 600); repeated descriptions are cached (about 60 ms per call). The ranker receives at most 1000 targets, input fields and select options first, then clicks in observed order; later targets are offered only if budget remains after the ranked ones. The MediaPipe Python GPU delegate is limited to Ubuntu.
+
+An embedding model is not used as the decision model. In the same measurements it chose the wrong target whenever the DOM was in its context, and it kept choosing `input` after the field already held the requested value.
+
 ## Verify completion independently
 
 `result.status == 'model_done'` means the decision model chose DONE. It does not prove that the task succeeded. `result.verified` defaults to `None`.
@@ -103,4 +136,10 @@ Run the offline contract and behavior tests with:
 
 ```bash
 uv run pytest tests/ci/test_microsoft_decision.py
+```
+
+The on-device ranker check needs the downloaded model, so it lives outside `tests/ci`:
+
+```bash
+MEDIAPIPE_DECISION_MODEL_PATH=embeddinggemma-2-text-270m.litertlm uv run --extra mediapipe pytest tests/scripts/test_mediapipe_ranker_live.py
 ```

@@ -1,11 +1,14 @@
 """Finite-choice decision agent using native BrowserSession and Tools."""
 
+import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from itertools import islice
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
@@ -222,6 +225,54 @@ class OpenAIDecisionClient:
 			raise ValueError('Invalid OpenAI Decisions response; no action executed.') from None
 
 
+class TargetRanker(Protocol):
+	async def rank(self, task: str, candidates: dict[str, str]) -> dict[str, float]: ...
+
+
+class MediaPipeTargetRanker:
+	"""On-device relevance ranker using MediaPipe Decision Maker, e.g. EmbeddingGemma 2.
+
+	It only orders observed targets when a page exceeds the candidate budget; the
+	decision model still chooses the operation and target.
+	"""
+
+	instructions = 'Rank observed browser targets by relevance to the task.'
+
+	def __init__(self, model_path: str | None = None, *, maker: Any = None, max_num_tokens: int = 2048):
+		self.max_num_tokens = max_num_tokens
+		self._owns_maker = maker is None
+		if maker is None:
+			if not model_path:
+				raise ValueError('Pass model_path, for example embeddinggemma-2-text-270m.litertlm, or maker.')
+			try:
+				from mediapipe.tasks.python.core.base_options import BaseOptions  # type: ignore[reportMissingImports]
+				from mediapipe.tasks.python.decision.decision_maker import (  # type: ignore[reportMissingImports]
+					DecisionMaker,
+					DecisionMakerOptions,
+				)
+			except ImportError:
+				raise ImportError('Install the optional extra: browser-use[mediapipe].') from None
+			maker = DecisionMaker.create_from_options(
+				DecisionMakerOptions(base_options=BaseOptions(model_asset_path=model_path), max_num_tokens=max_num_tokens)
+			)
+		self._maker = maker
+
+	async def rank(self, task: str, candidates: dict[str, str]) -> dict[str, float]:
+		# MediaPipe silently drops context beyond max_num_tokens; tokens never exceed UTF-8 bytes here.
+		if len(task.encode()) + len(self.instructions.encode()) + 64 > self.max_num_tokens:
+			raise ValueError('Task exceeds the on-device ranker token limit; no action executed.')
+		from mediapipe.tasks.python.decision.decision_maker import ChoiceQuestion  # type: ignore[reportMissingImports]
+
+		question = ChoiceQuestion(criteria=candidates, instructions=self.instructions)
+		result = await asyncio.to_thread(self._maker.evaluate_choice, task, question)
+		return dict(result.probabilities)
+
+	def close(self) -> None:
+		"""Release a model created from model_path; an injected maker stays caller-owned."""
+		if self._owns_maker:
+			self._maker.close()
+
+
 class DecisionTask(BaseModel):
 	task: str = Field(min_length=1, max_length=4000)
 
@@ -270,12 +321,14 @@ class DecisionAgent:
 		browser: BrowserSession | None = None,
 		*,
 		text_llm: BaseChatModel | None = None,
+		target_ranker: TargetRanker | None = None,
 	):
 		self.task = DecisionTask(task=task).task
 		self.decision_model = decision_model
 		self.browser = browser if browser is not None else BrowserSession()
 		self._owns_browser = browser is None
 		self.text_llm = text_llm
+		self.target_ranker = target_ranker
 		self.tools = Tools()
 		self._action_model = self.tools.registry.create_action_model(
 			include_actions=['click', 'input', 'select_dropdown', 'scroll', 'wait']
@@ -306,6 +359,9 @@ class DecisionAgent:
 		return re.sub(r'[\t\n\f\r ]+', ' ', ''.join(text)).strip(' \t\n\f\r')
 
 	def _targets(self, state: BrowserStateSummary) -> dict[str, dict[str, DecisionTarget]]:
+		return self._bound(self._candidates(state))
+
+	def _candidates(self, state: BrowserStateSummary) -> dict[str, dict[str, DecisionTarget]]:
 		targets: dict[str, dict[str, DecisionTarget]] = {'click': {}, 'input': {}, 'select': {}}
 		for index, node in sorted(state.dom_state.selector_map.items()):
 			if index < 1 or node.is_visible is False or 'disabled' in node.attributes:
@@ -363,7 +419,7 @@ class DecisionAgent:
 						),
 						None,
 					)
-					if text is not None and len(targets['select']) < 250:
+					if text is not None:
 						key = f'{index}:{position}'
 						targets['select'][key] = DecisionTarget(
 							index=index,
@@ -377,28 +433,58 @@ class DecisionAgent:
 					and 'readonly' not in node.attributes
 					and node.attributes.get('type', 'text').lower()
 					not in {'hidden', 'file', 'checkbox', 'radio', 'submit', 'button', 'reset', 'image'}
-					and len(targets['input']) < 250
 				):
 					targets['input'][str(index)] = DecisionTarget(index=index, description=description)
-				elif (
-					node.attributes.get('type', '').lower() in {'checkbox', 'radio', 'submit', 'button', 'reset', 'image'}
-					and len(targets['click']) < 250
-				):
+				elif node.attributes.get('type', '').lower() in {'checkbox', 'radio', 'submit', 'button', 'reset', 'image'}:
 					targets['click'][str(index)] = DecisionTarget(index=index, description=description)
-			elif len(targets['click']) < 250:
+			else:
 				targets['click'][str(index)] = DecisionTarget(index=index, description=description)
-		# Keep the first observed targets within one shared candidate and byte budget.
+		return targets
+
+	def _bound(
+		self, targets: dict[str, dict[str, DecisionTarget]], scores: dict[str, float] | None = None
+	) -> dict[str, dict[str, DecisionTarget]]:
+		"""Keep targets in observed (or ranked) order within one shared candidate and byte budget."""
+		items = [(operation, key, target) for operation, candidates in targets.items() for key, target in candidates.items()]
+		if scores is not None:
+			# Stable sort: unranked targets follow ranked ones, ties keep observed order.
+			items.sort(key=lambda item: -scores.get(f'{item[0]}:{item[1]}', -math.inf))
 		remaining = 250
 		byte_budget = max(2000, 16000 - len(self.task.encode()))
 		bounded: dict[str, dict[str, DecisionTarget]] = {}
-		for operation, candidates in targets.items():
-			for key, target in candidates.items():
-				size = len(json.dumps({key: target.description}, ensure_ascii=False).encode())
-				if remaining and size <= byte_budget:
-					bounded.setdefault(operation, {})[key] = target
-					remaining -= 1
-					byte_budget -= size
+		for operation, key, target in items:
+			size = len(json.dumps({key: target.description}, ensure_ascii=False).encode())
+			if remaining and size <= byte_budget:
+				bounded.setdefault(operation, {})[key] = target
+				remaining -= 1
+				byte_budget -= size
 		return bounded
+
+	async def _ranked_targets(self, state: BrowserStateSummary) -> dict[str, dict[str, DecisionTarget]]:
+		candidates = self._candidates(state)
+		targets = self._bound(candidates)
+		if self.target_ranker is None or sum(map(len, targets.values())) == sum(map(len, candidates.values())):
+			return targets
+		# ponytail: cold ranking embeds every description (~60 ms each on CPU); 1000 caps the first step near a minute.
+		# Form targets are few and are the ones observed order crowds out, so they are always ranked first.
+		flat = dict(
+			islice(
+				(
+					(f'{operation}:{key}', t.description)
+					for operation in ('input', 'select', 'click')
+					for key, t in candidates.get(operation, {}).items()
+				),
+				1000,
+			)
+		)
+		scores = await self.target_ranker.rank(self.task, flat)
+		if (
+			not isinstance(scores, dict)
+			or set(scores) != set(flat)
+			or not all(isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v) for v in scores.values())
+		):
+			raise ValueError('Invalid target ranking; no action executed.')
+		return self._bound(candidates, scores)
 
 	def _fingerprint(self, state: BrowserStateSummary) -> str:
 		def without_history(node: SimplifiedNode) -> SimplifiedNode:
@@ -528,7 +614,7 @@ class DecisionAgent:
 				if state.state_error:
 					return DecisionRunResult(status='blocked', steps=steps)
 				fingerprint = self._fingerprint(state)
-				targets = self._targets(state)
+				targets = await self._ranked_targets(state)
 				request = self._request(state, targets, steps)
 				response = DecisionResponse.model_validate(await self.decision_model.predict(request))
 				operation = ChoiceAnswer.validate_for(

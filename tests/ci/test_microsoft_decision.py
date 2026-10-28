@@ -864,3 +864,85 @@ def test_select_candidates_show_current_label_from_accessibility_state():
 	a, _, _ = agent(nodes={1: field})
 	for target in a._targets(state({1: field}))['select'].values():
 		assert json.loads(target.description.split(': label=', 1)[0])['current_value'] == 'Blue'
+
+
+class ScriptedRanker:
+	def __init__(self, preferred, *, drop=False):
+		self.preferred = preferred
+		self.drop = drop
+		self.calls = []
+
+	async def rank(self, task, candidates):
+		self.calls.append((task, dict(candidates)))
+		scores = {key: (1.0 if key in self.preferred else 0.0) for key in candidates}
+		if self.drop:
+			scores.pop(next(iter(scores)))
+		return scores
+
+
+def ranked_agent(nodes, ranker, operation='click', target=None):
+	browser = AsyncMock(spec=BrowserSession)
+	browser.agent_focus_target_id = 'target'
+	browser.get_browser_state_summary.return_value = state(nodes)
+	decision = ScriptedDecision(operation, target)
+	a = MicrosoftDecisionAgent(
+		'Enter Ada in the name field', decision, browser=browser, text_llm=AsyncMock(spec=BaseChatModel), target_ranker=ranker
+	)
+	a.tools.act = AsyncMock(return_value=ActionResult(extracted_content='ok'))
+	return a, decision
+
+
+async def test_target_ranker_keeps_relevant_targets_on_large_pages():
+	nodes = {i: node(i) for i in range(1, 401)}
+	nodes[401] = node(401, 'input', {'name': 'name'})
+	ranker = ScriptedRanker({'input:401', 'click:300'})
+	a, decision = ranked_agent(nodes, ranker, 'click', '300')
+	# Observed-order bounding alone spends the whole budget on earlier buttons.
+	assert 'input' not in a._targets(state(nodes))
+	result = await a.run(1)
+	assert result.steps[0].index == 300
+	((task, candidates),) = ranker.calls
+	assert task == 'Enter Ada in the name field' and len(candidates) == 401
+	questions = decision.requests[0].questions
+	# Ranked order still respects the shared candidate and byte budget.
+	assert next(iter(questions['click_target'].criteria)) == '300'
+	assert len(questions['click_target'].criteria) < len(a._targets(state(nodes))['click'])
+	assert decision.requests[0].state['sole_targets'] == {'input': {'401': candidates['input:401']}}
+
+
+async def test_target_ranker_input_is_capped_and_unranked_targets_follow():
+	nodes = {i: node(i) for i in range(1, 1201)}
+	nodes[1201] = node(1201, 'input', {'name': 'name'})
+	ranker = ScriptedRanker({'click:999'})
+	a, decision = ranked_agent(nodes, ranker, 'click', '999')
+	assert (await a.run(1)).steps[0].index == 999
+	# A late form field is still ranked; clicks fill the rest of the cap in observed order.
+	assert list(ranker.calls[0][1]) == ['input:1201'] + [f'click:{i}' for i in range(1, 1000)]
+	assert '1000' not in decision.requests[0].questions['click_target'].criteria
+
+
+async def test_target_ranker_skipped_when_all_targets_fit():
+	ranker = ScriptedRanker(set())
+	a, decision = ranked_agent({1: node(1), 2: node(2)}, ranker, 'click', '2')
+	assert (await a.run(1)).steps[0].index == 2
+	assert not ranker.calls and len(decision.requests) == 1
+
+
+async def test_invalid_target_ranking_stops_before_prediction():
+	ranker = ScriptedRanker(set(), drop=True)
+	a, decision = ranked_agent({i: node(i) for i in range(1, 300)}, ranker)
+	with pytest.raises(ValueError, match='no action executed'):
+		await a.run(1)
+	assert not decision.requests
+
+
+async def test_mediapipe_ranker_rejects_task_beyond_token_limit():
+	from browser_use.decision import MediaPipeTargetRanker
+
+	class UnusedMaker:
+		def evaluate_choice(self, text, question):
+			raise AssertionError('truncated context must not reach the model')
+
+	ranker = MediaPipeTargetRanker(maker=UnusedMaker(), max_num_tokens=128)
+	with pytest.raises(ValueError, match='token limit'):
+		await ranker.rank('x' * 200, {'a': 'A', 'b': 'B'})

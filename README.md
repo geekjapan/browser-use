@@ -102,7 +102,7 @@ Install or upgrade browser-use to the latest stable version with uv using Python
 
 ## Path 3: Python Library
 
-For finite-choice agents using Azure or OpenAI, see [Use Azure Microsoft Decision 1 or OpenAI Decisions](MICROSOFT_DECISION.md).
+For finite-choice agents using Azure (Microsoft Foundry) or OpenAI, with optional on-device EmbeddingGemma 2 target ranking, see [Use Azure Microsoft Decision 1 or OpenAI Decisions](MICROSOFT_DECISION.md).
 
 Run the Browser Use agent locally from Python, with your choice of model and a local or cloud browser:
 
